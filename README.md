@@ -17,3 +17,6 @@ Run ./parallel_cpu
 Parallel CPU w/ decompression:
 Compile: g++ -std=c++17 -O2 -fopenmp parallel_cpu_decomp.cpp -o parallel_decomp_cpu
 Run: ./parallel_decomp_cpu
+
+grep -nP "[\x80-\xFF]" your_file.cpp
+No output = no non-ASCII garbage
