@@ -16,7 +16,7 @@
 #include <omp.h>
 #include <array>
 
-int thread_count = 16;
+int thread_count = 4;
 constexpr size_t DECODE_BLOCK_SIZE = 1024 * 64; // 64KB block size
 constexpr int LUT_BITS = 8; // small byte-wise LUT
 
@@ -157,14 +157,15 @@ private:
 
     // sequential bit-level decode within a bit-range using trie (byte-wise LUT speedup)
     std::vector<uint8_t> sequentialDecodeRange(const std::string& fullBitstream,
-                                               size_t start_bit, size_t end_bit,
-                                               TrieNode* trie, const std::array<LUTEntry,1<<LUT_BITS>& lut)
+                                              size_t start_bit, size_t end_bit,
+                                              TrieNode* trie, const std::array<LUTEntry,1<<LUT_BITS>& lut)
     {
         std::vector<uint8_t> out;
         size_t pos = start_bit;
         while (pos < end_bit) {
             // try LUT if enough bits
             if (end_bit - pos >= LUT_BITS) {
+                // Read next LUT_BITS bits
                 int idx = 0;
                 for (int i=0;i<LUT_BITS;i++) {
                     idx = (idx<<1) | (fullBitstream[pos + i] - '0');
@@ -176,17 +177,22 @@ private:
                     continue;
                 }
             }
+            
             // fallback to trie bit-by-bit
             TrieNode* cur = trie;
             size_t p = pos;
             bool found = false;
-            while (p < end_bit && cur) {
+            
+            // Limit trie search to avoid reading beyond end_bit (up to max_code_len_ bits)
+            size_t max_search_p = std::min(pos + max_code_len_, end_bit); 
+
+            while (p < max_search_p && cur) {
                 int b = fullBitstream[p] - '0';
                 cur = cur->child[b];
                 p++;
                 if (cur && cur->symbol >= 0) {
                     out.push_back(static_cast<uint8_t>(cur->symbol));
-                    pos = p;
+                    pos = p; // update main position
                     found = true;
                     break;
                 }
@@ -202,31 +208,34 @@ private:
     // Align start bit: scan backwards up to max_code_len_ bits and try to find a boundary so that the first decoded symbol ends at or after nominal_start
     size_t align_start_bit(const std::string& fullBitstream, size_t nominal_start, size_t total_bits, TrieNode* trie, const std::array<LUTEntry,1<<LUT_BITS>& lut) {
         size_t max_back = std::min(static_cast<size_t>(max_code_len_), nominal_start);
-        // try each candidate start from (nominal_start - max_back) up to nominal_start
-        for (size_t back = 0; back <= max_back; ++back) {
-            size_t cand = nominal_start - (max_back - back); // increasing candidate
-            // try decode one symbol from cand; if the decoded symbol ends at or after nominal_start, accept
-            // decode up to max_code_len_ bits
+        
+        // Try candidate starts from nominal_start - max_back up to nominal_start - 1 (nominal_start itself is not checked here)
+        for (size_t cand_offset = max_back; cand_offset > 0; --cand_offset) {
+            size_t cand = nominal_start - cand_offset; // candidate start bit position
+            
+            // Decode up to max_code_len_ bits starting from cand
             size_t try_end = std::min(cand + max_code_len_, total_bits);
-            std::vector<uint8_t> tmp = sequentialDecodeRange(fullBitstream, cand, try_end, trie, lut);
-            if (!tmp.empty()) {
-                // compute where the first symbol ended: decode length in bits = try_end - cand? Need exact
-                // We can re-run bitwise to find first symbol end precisely
-                TrieNode* cur = trie;
-                size_t p = cand;
-                while (p < try_end && cur) {
-                    int b = fullBitstream[p] - '0';
-                    cur = cur->child[b];
-                    p++;
-                    if (cur && cur->symbol >= 0) {
-                        size_t symbol_end = p;
-                        if (symbol_end >= nominal_start) return cand;
-                        break; // first symbol finished earlier than nominal_start => not acceptable
+            
+            TrieNode* cur = trie;
+            size_t p = cand;
+            while (p < try_end && cur) {
+                int b = fullBitstream[p] - '0';
+                cur = cur->child[b];
+                p++; // p is the bit position *after* the current bit
+                
+                if (cur && cur->symbol >= 0) {
+                    // Found a symbol ending at bit position p
+                    if (p > nominal_start) {
+                        // The symbol decoded starts before nominal_start but ENDS AFTER nominal_start.
+                        // This is a valid, aligned start for this block.
+                        return cand;
                     }
+                    // Symbol ended at or before nominal_start. Continue to the next symbol starting at p.
+                    cur = trie;
                 }
             }
         }
-        // fallback: return nominal_start (will likely decode partial / stop quickly)
+        // If no pre-boundary start was found, fall back to nominal_start.
         return nominal_start;
     }
 
@@ -235,6 +244,12 @@ private:
         int padding = 0;
         std::unordered_map<uint8_t,std::string> codes;
         readHeader(compressed, index, padding, codes);
+        
+        // Need to set max_code_len_ from header if not set by encode
+        if (max_code_len_ == 0) {
+            for (auto &p : codes) if (p.second.size() > max_code_len_) max_code_len_ = p.second.size();
+        }
+        
         if (index > compressed.size()) return {};
 
         // build decode structures
@@ -267,44 +282,72 @@ private:
             size_t start_bit_nominal = bidx * bits_per_block;
             size_t end_bit = std::min(start_bit_nominal + bits_per_block, total_bits);
 
-            // align start bit by scanning within max_code_len_ bits (gap alignment)
+            // align start bit: only apply alignment for blocks after the first one (bidx > 0)
             size_t aligned_start = start_bit_nominal;
             if (start_bit_nominal > 0) {
                 aligned_start = align_start_bit(fullBitstream, start_bit_nominal, total_bits, trie, lut);
             }
 
-            // decode from aligned_start up to end_bit (but avoid decoding symbols that end entirely before nominal start)
-            auto local_decoded = sequentialDecodeRange(fullBitstream, aligned_start, end_bit, trie, lut);
+            // decode from aligned_start up to end_bit
+            std::vector<uint8_t> local_decoded = sequentialDecodeRange(fullBitstream, aligned_start, end_bit, trie, lut);
 
-            // If aligned_start < nominal start, drop decoded symbols that finish before nominal start
+            // CRITICAL FIX: If alignment caused an overlap, skip the symbols that belong to the previous block.
             if (aligned_start < start_bit_nominal && !local_decoded.empty()) {
-                // To decide how many symbols to drop, re-simulate bit traversal until we reach nominal_start
-                std::vector<uint8_t> kept;
+                // Re-simulate bit traversal from aligned_start to find the symbol index that corresponds to nominal_start
                 size_t p = aligned_start;
                 TrieNode* cur = trie;
+                int symbols_to_skip = 0;
+                bool keep_found = false;
+
                 while (p < end_bit) {
-                    int b = fullBitstream[p] - '0';
-                    cur = cur->child[b];
-                    p++;
-                    if (cur && cur->symbol >= 0) {
-                        if (p > start_bit_nominal) {
-                            // this symbol crosses the nominal start bit -> keep it and all subsequent
-                            kept.push_back(static_cast<uint8_t>(cur->symbol));
-                            // now append rest of decoded symbols by re-decoding the remainder
-                            if (p < end_bit) {
-                                auto remainder = sequentialDecodeRange(fullBitstream, p, end_bit, trie, lut);
-                                kept.insert(kept.end(), remainder.begin(), remainder.end());
+                    
+                    // Traverse one symbol bit-by-bit
+                    size_t symbol_start_p = p;
+                    TrieNode* current_node = trie;
+                    size_t q = p;
+
+                    while (q < end_bit && current_node) {
+                        int b = fullBitstream[q] - '0';
+                        current_node = current_node->child[b];
+                        q++;
+                        
+                        if (current_node && current_node->symbol >= 0) {
+                            // Symbol finished at bit position q
+                            p = q; // Update main bit pointer to the end of the current symbol
+                            
+                            if (p > start_bit_nominal) {
+                                // This is the first symbol that ENDS AFTER the nominal boundary. Keep it.
+                                keep_found = true;
+                                goto end_skip_loop;
+                            } else {
+                                // Symbol ended AT or BEFORE the nominal boundary. Skip it.
+                                symbols_to_skip++;
+                                break; // Break inner traversal, continue outer while loop
                             }
-                            break;
-                        } else {
-                            // symbol ended before nominal start -> drop
-                            cur = trie;
-                            continue;
                         }
                     }
+                    
+                    if (!keep_found && q >= end_bit) {
+                        break; // Reached end of block without finding a symbol to keep.
+                    }
                 }
-                decoded_blocks[bidx] = std::move(kept);
+                
+                end_skip_loop:;
+
+                // Apply the skip count to the pre-decoded vector
+                if (keep_found && symbols_to_skip > 0 && symbols_to_skip < local_decoded.size()) {
+                    // Erase the symbols that belong to the previous block.
+                    local_decoded.erase(local_decoded.begin(), local_decoded.begin() + symbols_to_skip);
+                    decoded_blocks[bidx] = std::move(local_decoded);
+                } else if (symbols_to_skip == 0 && keep_found) {
+                    // This can happen if the first symbol starts AT or near nominal_start and ends AFTER it. No skip needed.
+                    decoded_blocks[bidx] = std::move(local_decoded);
+                } else {
+                    // All symbols were dropped, or block ended before finding a symbol to keep.
+                    decoded_blocks[bidx].clear();
+                }
             } else {
+                // No alignment needed (bidx=0) or aligned_start == nominal_start. Keep all.
                 decoded_blocks[bidx] = std::move(local_decoded);
             }
         }
@@ -316,7 +359,6 @@ private:
         std::vector<uint8_t> output;
         output.reserve(total_out);
         for (size_t i=0;i<decoded_blocks.size();++i) {
-            // Note: we do not perform additional cross-block fixes here because alignment dropped overlapping symbols
             output.insert(output.end(), decoded_blocks[i].begin(), decoded_blocks[i].end());
         }
 
@@ -336,7 +378,12 @@ private:
         std::priority_queue<Node*, std::vector<Node*>, NodeCompare> pq;
         for (auto &p : freq) pq.push(new Node(p.first, p.second));
         if (pq.empty()) return nullptr;
-        if (pq.size() == 1) { Node* x = pq.top(); pq.pop(); return new Node(x, new Node(0,0)); }
+        // Handle single symbol case: ensure a two-node root for a valid code ("0")
+        if (pq.size() == 1) { 
+             Node* x = pq.top(); pq.pop(); 
+             Node* dummy_leaf = new Node(0, 0); 
+             return new Node(x, dummy_leaf); 
+        }
         while (pq.size() > 1) {
             Node* a = pq.top(); pq.pop();
             Node* b = pq.top(); pq.pop();
@@ -432,12 +479,12 @@ int main(int argc, char** argv) {
         bool ok = (data.size() == decompressed.size()) && std::equal(data.begin(), data.end(), decompressed.begin());
 
         std::cout << "\n=== Parallel CPU Results ===\n";
-        std::cout << "Original size:  " << data.size() << " bytes\n";
+        std::cout << "Original size:  " << data.size() << " bytes\n";
         std::cout << "Compressed size:" << compressed.size() << " bytes\n";
         std::cout << "Compression ratio: " << (100.0 * compressed.size() / data.size()) << "%\n\n";
-        std::cout << "Compression time:   " << enc_us << " us\n";
+        std::cout << "Compression time:   " << enc_us << " us\n";
         std::cout << "Decompression time: " << dec_us << " us\n";
-        std::cout << "Verification:       " << (ok ? "PASS" : "FAIL") << "\n";
+        std::cout << "Verification:       " << (ok ? "PASS" : "FAIL") << "\n";
         auto t_all_e = std::chrono::high_resolution_clock::now();
         auto wall_us = std::chrono::duration_cast<std::chrono::microseconds>(t_all_e - t_all_s).count();
         //std::cout << "Wall elapsed (main): " << wall_us << " us\n";
